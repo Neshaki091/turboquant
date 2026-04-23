@@ -1,34 +1,34 @@
 import math
 import torch
 import torch.nn.functional as F
-from typing import Optional, Tuple, NamedTuple
+from typing import Optional, Tuple, NamedTuple, List
 
-from tq_engine.codebook import get_codebook_tensors
+from tq_engine.codebook import get_codebook_tensors, get_polar_codebooks
 from tq_engine.rotation import (
     generate_rotation_matrix,
     generate_qjl_matrix,
     rotate_forward,
     rotate_backward,
 )
+from tq_engine.polar import recursive_polar_transform, recursive_polar_reconstruct
 
 # =============================================================================
 # Cấu trúc dữ liệu kết quả nén
 # =============================================================================
 
-class MSEQuantized(NamedTuple):
-    """Kết quả nén MSE (Algorithm 1)"""
-    indices: torch.Tensor       # Các chỉ số centroids (đã đóng gói bit)
-    norms: torch.Tensor         # Độ dài L2 của vector gốc
-    bits: int                   # Số bit dùng cho mỗi phần tử
+class PolarQuantized(NamedTuple):
+    """Kết quả nén Polar (Recursive Polar Transform)"""
+    angle_indices: List[torch.Tensor] # Các chỉ số góc (List Level-wise)
+    final_radius: torch.Tensor       # Bán kính cuối cùng (Level L)
+    bits_list: List[int]             # Số bit dùng cho từng level
 
 
 class ProdQuantized(NamedTuple):
-    """Kết quả nén cho Inner Product (Algorithm 2 - MSE + QJL)"""
-    mse_indices: torch.Tensor   # Chỉ số nén MSE stage 1
-    qjl_signs: torch.Tensor    # Các bit dấu (+1/-1) nén từ stage 2 QJL
-    residual_norms: torch.Tensor  # Độ dài vector phần dư (residual)
-    norms: torch.Tensor         # Độ dài vector gốc
-    mse_bits: int               # Số bit MSE
+    """Kết quả nén cho Inner Product (Algorithm 2 - Polar + QJL)"""
+    polar_q: PolarQuantized     # Kết quả nén Polar stage 1
+    qjl_signs: torch.Tensor     # Các bit dấu (+1/-1) nén từ stage 2 QJL
+    residual_norms: torch.Tensor # Độ dài vector phần dư (residual)
+    norms: torch.Tensor         # Độ dài vector gốc (để benchmark hoặc fallback)
 
 
 # =============================================================================
@@ -82,48 +82,58 @@ def _unpack_indices(packed: torch.Tensor, bits: int, d: int) -> torch.Tensor:
 
 
 # =============================================================================
-# ENGINE 1: Nén MSE (Tối ưu cho việc tái tạo vector)
+# ENGINE 1: Nén Polar (Tối ưu theo kiến trúc mới)
 # =============================================================================
 
-class TQEngineMSE(torch.nn.Module):
-    def __init__(self, dim: int, bits: int = 3, device: torch.device = None, dtype: torch.dtype = torch.float32, seed: int = 42):
+class TQEnginePolar(torch.nn.Module):
+    def __init__(self, dim: int, levels: int = 4, bits_list: Optional[List[int]] = None, device: torch.device = None, dtype: torch.dtype = torch.float32, seed: int = 42):
         super().__init__()
         self.dim = dim
-        self.bits = bits
+        self.levels = levels
+        # Mặc định: 4 bit cho L1, 2 bit cho các level sau theo paper
+        self.bits_list = bits_list or ([4] + [2] * (levels - 1))
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # Khởi tạo ma trận quay Pi
         self.register_buffer("Pi", generate_rotation_matrix(dim, self.device, dtype, seed=seed))
 
-        # Khởi tạo bảng mã
-        centroids, boundaries = get_codebook_tensors(dim, bits, self.device, dtype)
-        self.register_buffer("centroids", centroids)
-        self.register_buffer("decision_boundaries", boundaries[1:-1].contiguous())
-
-    @torch.no_grad()
-    def quantize(self, x: torch.Tensor, micro_batch: int = 100000) -> MSEQuantized:
-        """Nén vector sang dạng indices với cơ chế micro-batching chống tràn RAM."""
-        norms = x.norm(dim=-1)
-        packed_list = []
+        # Khởi tạo bảng mã cho từng level
+        self.codebooks = get_polar_codebooks(levels, self.bits_list, self.device, dtype)
         
-        for i in range(0, x.size(0), micro_batch):
-            chunk = x[i : i + micro_batch]
-            chunk_unit = chunk / (chunk.norm(dim=-1, keepdim=True) + 1e-10)
+    @torch.no_grad()
+    def quantize(self, x: torch.Tensor, micro_batch: int = 100000) -> PolarQuantized:
+        """Nén vector sang dạng Polar angles."""
+        y = rotate_forward(x.float(), self.Pi)
+        final_radius, angles = recursive_polar_transform(y, self.levels)
+        
+        packed_angles = []
+        for l in range(1, self.levels + 1):
+            angle = angles[l-1]
+            centroids, boundaries = self.codebooks[l-1]
+            n_clusters = len(centroids)
+            # searchsorted trả về vị trí insert trong boundaries (len n_clusters+1)
+            # Index hợp lệ: [0, n_clusters-1]
+            indices = torch.searchsorted(boundaries.contiguous(), angle.contiguous())
+            # Clamp để tránh out-of-bounds
+            indices = indices.clamp(0, n_clusters - 1)
+            packed_angles.append(_pack_indices(indices, self.bits_list[l-1]))
             
-            # Quay và tìm centroid gần nhất
-            y = rotate_forward(chunk_unit.float(), self.Pi)
-            indices = torch.searchsorted(self.decision_boundaries, y.contiguous())
-            
-            packed_list.append(_pack_indices(indices, self.bits))
-            
-        return MSEQuantized(indices=torch.cat(packed_list, dim=0), norms=norms, bits=self.bits)
+        return PolarQuantized(angle_indices=packed_angles, final_radius=final_radius, bits_list=self.bits_list)
 
-    def dequantize(self, q: MSEQuantized) -> torch.Tensor:
+    def dequantize(self, q: PolarQuantized) -> torch.Tensor:
         """Giải nén và quay ngược về không gian gốc."""
-        indices = _unpack_indices(q.indices, q.bits, self.dim)
-        y_hat = self.centroids[indices]
+        unpacked_angles = []
+        for l in range(1, self.levels + 1):
+            bits = q.bits_list[l-1]
+            # Tính toán dim của level này: dim / 2^l
+            level_dim = self.dim // (2**l)
+            indices = _unpack_indices(q.angle_indices[l-1], bits, level_dim)
+            centroids, _ = self.codebooks[l-1]
+            unpacked_angles.append(centroids[indices])
+            
+        y_hat = recursive_polar_reconstruct(q.final_radius, unpacked_angles)
         x_hat = rotate_backward(y_hat, self.Pi)
-        return x_hat * q.norms.unsqueeze(-1)
+        return x_hat
 
 
 # =============================================================================
@@ -138,9 +148,18 @@ class TQEngine(torch.nn.Module):
         self.use_qjl = use_qjl
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Phân bổ bit: Nếu dùng QJL thì MSE chiếm b-1 bits, 1 bit dành cho QJL
-        mse_bits = (bits - 1 if use_qjl else bits) if bits > 1 else 1
-        self.mse_quantizer = TQEngineMSE(dim=dim, bits=mse_bits, device=self.device, dtype=dtype, seed=seed)
+        # Cấu hình PolarQuant: levels=4 cho d=128
+        levels = 4 if dim >= 64 else 2
+        
+        # Bit allocation: Phân bổ lại bits dựa trên tổng ngân sách `bits`
+        # Level 1 quan trọng nhất nên cần nhiều bits hơn (thường là bits+1)
+        # Các level sau ít quan trọng hơn, lấy phần còn lại (tối thiểu là 2)
+        bits_l1 = bits + 1
+        bits_rest = max(2, bits - 1)
+        bits_list = [bits_l1] + [bits_rest] * (levels - 1)
+        
+        self.polar_quantizer = TQEnginePolar(dim=dim, levels=levels, bits_list=bits_list, device=self.device, dtype=dtype, seed=seed)
+
 
         if self.use_qjl:
             self.register_buffer("S", generate_qjl_matrix(dim, self.device, dtype, seed=seed + 1000))
@@ -163,53 +182,44 @@ class TQEngine(torch.nn.Module):
 
     @torch.no_grad()
     def quantize(self, x: torch.Tensor, micro_batch: int = 100000) -> ProdQuantized:
-        """Thực hiện nén 2 giai đoạn: MSE + QJL."""
-        mse_indices_list, qjl_signs_list, residual_norms_list = [], [], []
+        """Thực hiện nén 2 giai đoạn: Polar + QJL."""
         norms = x.norm(dim=-1)
-
-        for i in range(0, x.size(0), micro_batch):
-            chunk = x[i : i + micro_batch]
-            mse_q = self.mse_quantizer.quantize(chunk, micro_batch=micro_batch)
-            x_hat = self.mse_quantizer.dequantize(mse_q)
-            
-            residual = chunk - x_hat
-            res_norms = residual.norm(dim=-1)
-            
-            if self.use_qjl and self.S is not None:
-                projected = torch.matmul(residual.float(), self.S.T)
-                packed_signs = self._pack_qjl_signs(projected)
-            else:
-                packed_signs = torch.zeros((*residual.shape[:-1], (self.dim + 7) // 8), device=self.device, dtype=torch.uint8)
-            
-            mse_indices_list.append(mse_q.indices)
-            qjl_signs_list.append(packed_signs)
-            residual_norms_list.append(res_norms)
-
+        polar_q = self.polar_quantizer.quantize(x, micro_batch=micro_batch)
+        x_hat = self.polar_quantizer.dequantize(polar_q)
+        
+        residual = x - x_hat
+        res_norms = residual.norm(dim=-1)
+        
+        if self.use_qjl and self.S is not None:
+            projected = torch.matmul(residual.float(), self.S.T)
+            packed_signs = self._pack_qjl_signs(projected)
+        else:
+            packed_signs = torch.zeros((*residual.shape[:-1], (self.dim + 7) // 8), device=self.device, dtype=torch.uint8)
+        
         return ProdQuantized(
-            mse_indices=torch.cat(mse_indices_list, dim=0),
-            qjl_signs=torch.cat(qjl_signs_list, dim=0),
-            residual_norms=torch.cat(residual_norms_list, dim=0),
-            norms=norms,
-            mse_bits=self.mse_quantizer.bits
+            polar_q=polar_q,
+            qjl_signs=packed_signs,
+            residual_norms=res_norms,
+            norms=norms
         )
 
     def dequantize(self, q: ProdQuantized) -> torch.Tensor:
         """Giải nén vector từ cả 2 stage."""
-        x_mse = self.mse_quantizer.dequantize(MSEQuantized(q.mse_indices, q.norms, q.mse_bits))
+        x_polar = self.polar_quantizer.dequantize(q.polar_q)
         if self.use_qjl and self.S is not None:
             signs = self._unpack_qjl_signs(q.qjl_signs)
             x_qjl = torch.matmul(signs, self.S) * (self.qjl_scale * q.residual_norms.unsqueeze(-1))
-            return x_mse + x_qjl
-        return x_mse
+            return x_polar + x_qjl
+        return x_polar
 
     def attention_score(self, query: torch.Tensor, quantized_key: ProdQuantized) -> torch.Tensor:
         """Tính toán tích vô hướng query-key trực tiếp trên dạng nén (Asymmetric)."""
-        k_mse = self.mse_quantizer.dequantize(MSEQuantized(quantized_key.mse_indices, quantized_key.norms, quantized_key.mse_bits))
-        scores_mse = torch.matmul(query.float(), k_mse.float().transpose(-2, -1))
+        k_polar = self.polar_quantizer.dequantize(quantized_key.polar_q)
+        scores_polar = torch.matmul(query.float(), k_polar.float().transpose(-2, -1))
 
         if self.use_qjl and self.S is not None:
             q_sketched = torch.matmul(query.float(), self.S.T)
             signs = self._unpack_qjl_signs(quantized_key.qjl_signs)
             scores_qjl = torch.matmul(q_sketched, signs.transpose(-2, -1)) * (self.qjl_scale * quantized_key.residual_norms.unsqueeze(-2))
-            return scores_mse + scores_qjl.to(scores_mse.dtype)
-        return scores_mse
+            return scores_polar + scores_qjl.to(scores_polar.dtype)
+        return scores_polar

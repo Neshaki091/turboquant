@@ -1,13 +1,51 @@
 import torch
 import numpy as np
 import math
-from typing import Tuple
+from typing import Tuple, List
 
 # =============================================================================
-# MODUNE: BẢNG MÃ (CODEBOOK)
+# MODULE: BẢNG MÃ (CODEBOOK)
 # Chứa logic tạo các điểm centroids tối ưu cho việc nén TurboQuant.
-# Sử dụng phân phối Gaussian N(0, 1/dim) và thuật toán Lloyd-Max.
+# - Cartesian: Sử dụng Lloyd-Max Gaussian.
+# - Polar: Sử dụng phân phối góc sin^(2^(L-1)-1)(2theta).
 # =============================================================================
+
+def get_polar_codebooks(levels: int, bits_list: List[int], device: torch.device, dtype: torch.dtype) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    """
+    Tạo danh sách codebooks cho từng level của PolarQuant.
+    
+    - Level 1: góc atan2(x_{2i+1}, x_{2i}) với x là Cartesian -> range [-pi, pi]
+    - Level 2+: góc atan2(r_{2i+1}, r_{2i}) với r là radii (>= 0) -> range [0, pi/2]
+    """
+    codebooks = []
+    for l in range(1, levels + 1):
+        bits = bits_list[l-1]
+        n_clusters = 2**bits
+        
+        if l == 1:
+            # Level 1: atan2 trên tọa độ Cartesian -> range [-pi, pi]
+            centroids = torch.linspace(-math.pi, math.pi, n_clusters + 1,
+                                       device=device, dtype=torch.float32)
+            centroids = (centroids[:-1] + centroids[1:]) / 2.0
+        else:
+            # Level 2+: atan2 trên các radii (>= 0) -> range [0, pi/2]
+            centroids = torch.linspace(0.0, math.pi / 2.0, n_clusters + 1,
+                                       device=device, dtype=torch.float32)
+            centroids = (centroids[:-1] + centroids[1:]) / 2.0
+            
+        centroids = centroids.to(dtype=dtype).sort()[0]
+        
+        # Tạo Boundaries
+        boundaries = torch.zeros(n_clusters + 1, device=device, dtype=dtype)
+        boundaries[0] = -1e10
+        boundaries[-1] = 1e10
+        boundaries[1:-1] = (centroids[:-1] + centroids[1:]) / 2
+        
+        codebooks.append((centroids, boundaries))
+        
+    return codebooks
+
+
 
 def get_codebook_tensors(dim: int, bits: int, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
     """

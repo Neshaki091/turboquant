@@ -1,7 +1,7 @@
 from __future__ import annotations
 import torch
 from typing import Optional, NamedTuple, Any
-from tq_engine.quantizer import TQEngine, ProdQuantized
+from tq_engine.quantizer import TQEngine, ProdQuantized, PolarQuantized
 
 # =============================================================================
 # MODULE: LƯU TRỮ KV CACHE NÉN
@@ -103,22 +103,40 @@ class CompressedKVStore:
         self._flat = None
 
 
+def _flatten_polar(pq: PolarQuantized) -> PolarQuantized:
+    return PolarQuantized(
+        angle_indices=[idx.squeeze(0).contiguous() for idx in pq.angle_indices],
+        final_radius=pq.final_radius.squeeze(0).contiguous(),
+        bits_list=pq.bits_list
+    )
+
+def _concat_polar(chunks: list[PolarQuantized]) -> PolarQuantized:
+    # Concatenate level-wise angle indices
+    num_levels = len(chunks[0].angle_indices)
+    flat_angles = []
+    for l in range(num_levels):
+        flat_angles.append(torch.cat([c.angle_indices[l] for c in chunks], dim=-2))
+    
+    return PolarQuantized(
+        angle_indices=flat_angles,
+        final_radius=torch.cat([c.final_radius for c in chunks], dim=-1),
+        bits_list=chunks[0].bits_list
+    )
+
 def _flatten_pq(pq: ProdQuantized) -> ProdQuantized:
     """Xóa bỏ chiều batch (1, H, T, ...) -> (H, T, ...)."""
     return ProdQuantized(
-        mse_indices=pq.mse_indices.squeeze(0).contiguous(),
+        polar_q=_flatten_polar(pq.polar_q),
         qjl_signs=pq.qjl_signs.squeeze(0).contiguous(),
         residual_norms=pq.residual_norms.squeeze(0).contiguous(),
         norms=pq.norms.squeeze(0).contiguous(),
-        mse_bits=pq.mse_bits,
     )
 
 def _concat_prod_q(chunks: list[ProdQuantized]) -> ProdQuantized:
     """Ghép các chunk nén thành một tensor lớn duy nhất."""
     return ProdQuantized(
-        mse_indices=torch.cat([c.mse_indices for c in chunks], dim=-2),
+        polar_q=_concat_polar([c.polar_q for c in chunks]),
         qjl_signs=torch.cat([c.qjl_signs for c in chunks], dim=-2),
         residual_norms=torch.cat([c.residual_norms for c in chunks], dim=-1),
         norms=torch.cat([c.norms for c in chunks], dim=-1),
-        mse_bits=chunks[0].mse_bits,
     )
