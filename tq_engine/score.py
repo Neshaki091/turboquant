@@ -19,7 +19,7 @@ import torch.nn.functional as F
 
 from tq_engine.store import FlatCache, CompressedKVStore
 from tq_engine.kv_cache import dequantize_values
-from tq_engine.quantizer import tq_engineProd
+from tq_engine.quantizer import TQEngine
 
 logger = logging.getLogger("tq_engine.score")
 
@@ -84,7 +84,7 @@ def compute_hybrid_attention(
 def _attend_compressed_only(
     query: torch.Tensor,
     flat: FlatCache,
-    quantizer: tq_engineProd,
+    quantizer: TQEngine,
     gqa_ratio: int,
     num_kv_heads: int,
     scale: float,
@@ -114,7 +114,7 @@ def _attend_exact_only(
 def _attend_hybrid(
     query: torch.Tensor,
     flat: FlatCache,
-    quantizer: tq_engineProd,
+    quantizer: TQEngine,
     recent_k: torch.Tensor,
     recent_v: torch.Tensor,
     gqa_ratio: int,
