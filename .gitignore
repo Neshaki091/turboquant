@@ -12,9 +12,13 @@ qdrant_storage/
 backend/data/
 backend/__pycache__/
 backend/.pytest_cache/
+Benchmark/data
+Benchmark/tq_native/target
 data/
-tq_native/target/
+data_recall@k/
+
 # Frontend/
+test_backend/
 frontend/.next/
 frontend/node_modules/
 frontend/out/
