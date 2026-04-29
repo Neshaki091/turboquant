@@ -1,29 +1,18 @@
 use pyo3::prelude::*;
 
 mod turboquant;
-mod sq8;
-mod pq;
-mod baselines;
 
 #[pymodule]
 fn tq_native_lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Tự động sử dụng số luồng tối đa của hệ thống
     let _ = rayon::ThreadPoolBuilder::new().build_global();
 
-    // NEW CORE: Scalar Quantization (b-1) + QJL (1)
+    // TURBOQUANT CORE: SQ+QJL Quantization
     m.add_function(wrap_pyfunction!(turboquant::tq_scan, m)?)?;
     
-    // Legacy functions
+    // Legacy support (optional but kept for compatibility within TQ classes)
     m.add_function(wrap_pyfunction!(turboquant::tq_master_scan, m)?)?;
     m.add_function(wrap_pyfunction!(turboquant::mse_score_simd, m)?)?;
-    
-    // Baseline comparisons (New names for stress_5m.py)
-    m.add_function(wrap_pyfunction!(baselines::sq_scan, m)?)?;
-    m.add_function(wrap_pyfunction!(baselines::pq_scan, m)?)?;
-
-    // Original names
-    m.add_function(wrap_pyfunction!(sq8::sq8_score_simd, m)?)?;
-    m.add_function(wrap_pyfunction!(pq::pq_score_simd, m)?)?;
     
     Ok(())
 }

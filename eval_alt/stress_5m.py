@@ -1,7 +1,9 @@
 import os
+import sys
 import time
 import torch
 import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from TQ_engine_lib import tq_native_lib
 from TQ_engine_lib.quantizer import TQEngine
 import gc
@@ -17,7 +19,7 @@ def rotate_forward(x, rot_op):
 def stress_test():
     DIM = 768
     TOTAL_TOKENS = 5_000_000
-    N_QUERIES = 3
+    N_QUERIES = 20
     DATA_DIR = "data/stress_5m"
     TQ_DIR = f"{DATA_DIR}/tq_data"
     
@@ -176,18 +178,104 @@ def stress_test():
         del sq_buffer, signs_buffer, norms_buffer, res_buffer
         gc.collect()
         
-        results.append((f"TQ {bit_folder}", BATCH, peak_mem, total_time / N_QUERIES))
+    # --- 5. TurboQuant IVF ---
+    for bit_folder in ["2bit", "4bit"]:
+        ivf_prefix = f"tq_ivf_{bit_folder}"
+        ivf_dir = f"{TQ_DIR}/ivf_{bit_folder}"
+        
+        if os.path.exists(ivf_dir):
+            print(f"Benchmarking TQ IVF {bit_folder}...")
+            # Load meta
+            ivf_meta = np.load(f"{ivf_dir}/{ivf_prefix}_ivf_meta.npz")
+            pq_meta = np.load(f"{ivf_dir}/{ivf_prefix}_pq_meta.npz")
+            
+            coarse_centroids = torch.from_numpy(ivf_meta['coarse_centroids'])
+            list_offsets = ivf_meta['list_offsets']
+            
+            centroids = pq_meta['centroids']
+            sq_bits = int(pq_meta['sq_bits'])
+            qjl_scale = float(pq_meta['qjl_scale'])
+            rot_op_t = torch.from_numpy(pq_meta['rot_op'])
+            
+            n_probe = int(ivf_meta.get('ivf_nprobe', 32))
+            
+            sq_path = f"{ivf_dir}/{ivf_prefix}_sq_codes.npy"
+            signs_path = f"{ivf_dir}/{ivf_prefix}_qjl_signs.npy"
+            norms_path = f"{ivf_dir}/{ivf_prefix}_norms.npy"
+            res_path = f"{ivf_dir}/{ivf_prefix}_res_norms.npy"
+            
+            # Calculate max cluster size
+            max_cluster_size = int(np.max(np.diff(list_offsets)))
+            
+            sq_dim = DIM//2 if bit_folder == "4bit" else DIM//8
+            sq_buffer = np.zeros((max_cluster_size, sq_dim), dtype=np.uint8)
+            signs_buffer = np.zeros((max_cluster_size, DIM//8), dtype=np.uint8)
+            norms_buffer = np.zeros(max_cluster_size, dtype=np.float32)
+            res_buffer = np.zeros(max_cluster_size, dtype=np.float32)
+            
+            total_time = 0
+            peak_mem = 0
+            
+            f_sq = open(sq_path, "rb")
+            f_signs = open(signs_path, "rb")
+            f_norms = open(norms_path, "rb")
+            f_res = open(res_path, "rb")
+            
+            for _ in range(N_QUERIES):
+                query = torch.nn.functional.normalize(torch.randn(1, DIM), dim=-1)
+                q_rot = rotate_forward(query, rot_op_t).squeeze(0).numpy().astype(np.float32)
+                
+                t_start = time.perf_counter()
+                
+                q_sq = (query ** 2).sum(dim=1, keepdim=True)
+                c_sq = (coarse_centroids ** 2).sum(dim=1).unsqueeze(0)
+                dist = q_sq + c_sq - 2 * torch.mm(query, coarse_centroids.t())
+                top_c_indices = dist.topk(n_probe, dim=1, largest=False).indices.squeeze(0).cpu().tolist()
+                
+                for c_idx in top_c_indices:
+                    start = list_offsets[c_idx]
+                    end = list_offsets[c_idx+1]
+                    count = end - start
+                    if count == 0: continue
+                    
+                    f_sq.seek(128 + start * sq_dim)
+                    f_signs.seek(128 + start * (DIM//8))
+                    f_norms.seek(128 + start * 4)
+                    f_res.seek(128 + start * 4)
+                    
+                    f_sq.readinto(sq_buffer[:count].data)
+                    f_signs.readinto(signs_buffer[:count].data)
+                    f_norms.readinto(norms_buffer[:count].data)
+                    f_res.readinto(res_buffer[:count].data)
+                    
+                    _ = tq_native_lib.tq_scan(
+                        q_rot, sq_buffer[:count], centroids, norms_buffer[:count],
+                        signs_buffer[:count], res_buffer[:count], q_rot,
+                        qjl_scale, DIM, sq_bits
+                    )
+                
+                total_time += (time.perf_counter() - t_start)
+                peak_mem = max(peak_mem, get_current_memory_mb())
+                
+            f_sq.close(); f_signs.close(); f_norms.close(); f_res.close()
+            del sq_buffer, signs_buffer, norms_buffer, res_buffer
+            gc.collect()
+            
+            results.append((f"TQ-IVF {bit_folder}", f"probe:{n_probe}", peak_mem, total_time / N_QUERIES))
 
     # Final Report
     raw_lat = next((lat for name, b, r, lat in results if "RAW" in name), 1.0)
     
     print("\n" + "="*108)
-    print(f"{'Method':<15} | {'Batch':<10} | {'Peak RAM':<12} | {'Latency':<10} | {'QPS':<10} | {'Speedup'}")
+    print(f"{'Method':<15} | {'Batch':<11} | {'Peak RAM':<12} | {'Latency':<10} | {'QPS':<10} | {'Speedup'}")
     print("-" * 108)
     for name, batch, ram, lat in results:
         qps = 1.0 / lat if lat > 0 else 0
         speedup = raw_lat / lat if lat > 0 else 0
-        print(f"{name:<15} | {batch:>9,} | {ram:>9.1f} MB | {lat:>9.4f}s | {qps:>9.2f} | {speedup:>8.1f}x")
+        if isinstance(batch, int):
+            print(f"{name:<15} | {batch:>11,} | {ram:>9.1f} MB | {lat:>9.4f}s | {qps:>9.2f} | {speedup:>8.1f}x")
+        else:
+            print(f"{name:<15} | {str(batch):>11} | {ram:>9.1f} MB | {lat:>9.4f}s | {qps:>9.2f} | {speedup:>8.1f}x")
     print("="*108)
 
 if __name__ == "__main__":

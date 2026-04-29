@@ -6,7 +6,7 @@ import time
 import math
 from sklearn.cluster import MiniBatchKMeans
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from TQ_engine_lib.quantizer import TQEngine
 
@@ -135,13 +135,37 @@ def evaluate_tq_native(vectors, queries, ground_truth, k_values, bits=4):
     m_recall = {k: np.mean(all_recall[k]) * 100 for k in k_values}
     return m_top1, m_recall, qps
 
+def evaluate_tq_ivf(vectors, queries, ground_truth, k_values, bits=4):
+    print(f"  ---- TQ-IVF {bits}-bit (SQ+QJL Native with IVF)...")
+    dim = vectors.shape[1]
+    # Configure IVF parameters suitable for the dataset size (28378).
+    engine = TQEngine(dim=dim, bits=bits, device="cpu", use_ivf=True, ivf_nlist=256, ivf_nprobe=32)
+    pq_data = engine.quantize(vectors, online_clustering=False)
+    
+    all_top1 = {k: [] for k in k_values}
+    all_recall = {k: [] for k in k_values}
+    start = time.perf_counter()
+    max_k = max(k_values)
+    
+    for i in range(len(queries)):
+        top_indices, _ = engine.native_cosine_search(queries[i], pq_data, top_k=max_k)
+        m = measure_accuracy(top_indices.tolist(), ground_truth[i], k_values)
+        for k in k_values:
+            all_top1[k].append(m["top1_in_k"][k])
+            all_recall[k].append(m["set_recall"][k])
+            
+    qps = len(queries) / (time.perf_counter() - start)
+    m_top1 = {k: np.mean(all_top1[k]) * 100 for k in k_values}
+    m_recall = {k: np.mean(all_recall[k]) * 100 for k in k_values}
+    return m_top1, m_recall, qps
+
 # =============================================================================
 # MAIN
 # =============================================================================
 
 def run_accuracy_benchmark():
     print("\n" + "="*95)
-    print("TURBOQUANT COMPREHENSIVE RECALL: SQ vs PQ vs TQ (via TQ_engine_lib)")
+    print("TURBOQUANT COMPREHENSIVE RECALL: SQ vs PQ vs TQ vs TQ-IVF")
     print("===============================================================================================")
     print("Config: PQ trained on Highly Fragmented 256 samples (10@start, 50@1k, 100@10k, 50@13k, 46@end).")
     print("===============================================================================================")
@@ -151,7 +175,7 @@ def run_accuracy_benchmark():
     QUERY_PATH = os.path.join(BASE_DIR, "data_recall@k", "query.npy")
     
     K_VALUES = [1, 2, 4, 8, 16, 32, 64]
-    NUM_QUERIES = 50
+    NUM_QUERIES = 100
 
     if not os.path.exists(DATA_PATH):
         print(f"Error: Data file not found at {DATA_PATH}")
@@ -174,7 +198,7 @@ def run_accuracy_benchmark():
 
     results = []
     bit_modes = [2, 4]
-    methods = ["SQ", "PQ", "TQ"]
+    methods = ["SQ", "PQ", "TQ", "TQ-IVF"]
     
     for bits in bit_modes:
         for method in methods:
@@ -182,8 +206,10 @@ def run_accuracy_benchmark():
                 m_t, m_r, q = evaluate_sq(vectors, queries, ground_truth, K_VALUES, bits=bits)
             elif method == "PQ":
                 m_t, m_r, q = evaluate_pq(vectors, queries, ground_truth, K_VALUES, bits_per_dim=bits)
-            else:
+            elif method == "TQ":
                 m_t, m_r, q = evaluate_tq_native(vectors, queries, ground_truth, K_VALUES, bits=bits)
+            else:
+                m_t, m_r, q = evaluate_tq_ivf(vectors, queries, ground_truth, K_VALUES, bits=bits)
             
             results.append({
                 "label": f"{method} {bits}-bit",
